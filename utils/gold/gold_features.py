@@ -2,8 +2,6 @@ import pyspark.sql.functions as F
 
 from pyspark.sql.functions import col
 from pyspark.sql.types import StringType, IntegerType, FloatType
-from pyspark.sql.window import Window
-
 
 def process_gold_fin_attr(silver_fin_attr_dir, spark):
     filepath = silver_fin_attr_dir + "silver_financials_attributes.parquet"
@@ -254,75 +252,31 @@ def process_gold_fin_attr(silver_fin_attr_dir, spark):
     return df
 
 
-def process_gold_clickstream(silver_clickstream_dir, spark):
-    filepath = silver_clickstream_dir + "silver_clickstream.parquet"
-    df = spark.read.parquet(filepath)
-    print('loaded from:', filepath, 'row count:', df.count())
-
-    fe_cols = [f"fe_{i}" for i in range(1, 21)]
-    alpha = 0.1
-
-    # rank rows per customer by snapshot_date ascending (0 = oldest, 23 = most recent)
-    w = Window.partitionBy("Customer_ID").orderBy("snapshot_date")
-    df = df.withColumn("_rank", F.row_number().over(w) - 1)
-    df = df.withColumn("_weight", F.exp(F.lit(alpha) * col("_rank")))
-
-    # weighted sum columns
-    for c in fe_cols:
-        df = df.withColumn(f"_w_{c}", col("_weight") * col(c).cast(IntegerType()))
-
-    agg_exprs = (
-        [F.sum("_weight").alias("_sum_weight"), F.max("snapshot_date").alias("snapshot_date")] +
-        [F.sum(f"_w_{c}").alias(f"_wsum_{c}") for c in fe_cols]
-    )
-    df = df.groupBy("Customer_ID").agg(*agg_exprs)
-
-    # compute weighted mean per fe column, cast to float
-    for c in fe_cols:
-        df = df.withColumn(c, F.round(col(f"_wsum_{c}") / col("_sum_weight")).cast(IntegerType())).drop(f"_wsum_{c}")
-    df = df.drop("_sum_weight")
-
-    print(f"  Gold clickstream processed: {df.count()} rows, {len(df.columns)} cols. | unique Customer_IDs: {df.select('Customer_ID').distinct().count()}")
-    return df
-
-
 def process_gold_features_join(silver_fin_attr_dir, silver_clickstream_dir, gold_features_dir, spark):
     df_fin_attr = process_gold_fin_attr(silver_fin_attr_dir, spark)
-    df_clickstream = process_gold_clickstream(silver_clickstream_dir, spark)
+    df_fin_attr = df_fin_attr.withColumnRenamed("snapshot_date", "fin_attr_snapshot_date")
 
-    # left join on Customer_ID — drop clickstream snapshot_date to avoid conflict with fin_attr's
-    df_clickstream = df_clickstream.drop("snapshot_date").withColumn("_cs_flag", F.lit(1))
+    # load unaggregated clickstream and rename snapshot_date
+    cs_filepath = silver_clickstream_dir + "silver_clickstream.parquet"
+    df_clickstream = spark.read.parquet(cs_filepath)
+    df_clickstream = df_clickstream.withColumnRenamed("snapshot_date", "cs_snapshot_date")
+    print(f"  Loaded clickstream: {df_clickstream.count()} rows, {df_clickstream.select('Customer_ID').distinct().count()} unique customers.")
+
+    # left join — every fin_attr row is kept; clickstream rows fan out where multiple cs dates exist
     df = df_fin_attr.join(df_clickstream, on="Customer_ID", how="left")
-    df = df.withColumn("has_clickstream", F.when(col("_cs_flag").isNull(), 0).otherwise(1).cast(IntegerType()))
-    df = df.drop("_cs_flag")
-
-    # impute fe_1..fe_20 for no-clickstream customers by column-wise sampling from empirical distribution
-    import random as _random
-
-    fe_cols = [f"fe_{i}" for i in range(1, 21)]
-    df_with_cs = df.filter(col("has_clickstream") == 1)
-    df_no_cs = df.filter(col("has_clickstream") == 0)
-    n_recipients = df_no_cs.count()
-
-    def make_sampler(bc):
-        @F.udf(FloatType())
-        def _sample(_):
-            return float(_random.choice(bc.value))
-        return _sample
-
-    for c in fe_cols:
-        values = [row[c] for row in df_with_cs.select(c).collect() if row[c] is not None]
-        sampler = make_sampler(spark.sparkContext.broadcast(values))
-        df_no_cs = df_no_cs.withColumn(c, sampler(F.lit(0)))
-
-    df = df_with_cs.unionByName(df_no_cs)
-    print(f"  fe_1 to fe_20 imputed for {n_recipients} recipients via column-wise empirical sampling.")
-
-    # cast all fe columns to int (join and UDF can upcast to float)
-    for c in fe_cols:
-        df = df.withColumn(c, col(c).cast(IntegerType()))
-
+    df = df.withColumn("has_clickstream", F.when(col("cs_snapshot_date").isNotNull(), 1).otherwise(0).cast(IntegerType()))
     print(f"  Gold features joined: {df.count()} rows, {len(df.columns)} cols.")
+
+    # distribution: how many cs_snapshot_date rows does each Customer_ID have (null counts as 0)
+    cs_dist = (
+        df.groupBy("Customer_ID")
+          .agg(F.count("cs_snapshot_date").alias("num_cs_rows"))
+          .groupBy("num_cs_rows")
+          .agg(F.count("Customer_ID").alias("num_customers"))
+          .orderBy("num_cs_rows")
+    )
+    print("  Distribution of cs_snapshot_date rows per Customer_ID:")
+    cs_dist.show(truncate=False)
 
     # enforce column order
     occ_cols  = sorted([c for c in df.columns if c.startswith("Occupation_")])
@@ -333,7 +287,7 @@ def process_gold_features_join(silver_fin_attr_dir, silver_clickstream_dir, gold
     ordered_cols = (
         ["Customer_ID", "Age"] +
         occ_cols +
-        ["snapshot_date",
+        ["fin_attr_snapshot_date",
          "Monthly_Inhand_Salary", "Monthly_Inhand_Salary_binned",
          "Num_Bank_Accounts", "Num_Credit_Card", "Interest_Rate",
          "Num_of_Loan"] +
@@ -346,9 +300,9 @@ def process_gold_features_join(silver_fin_attr_dir, silver_clickstream_dir, gold
         poma_cols +
         ["Total_EMI_per_month", "Total_EMI_per_month_binned",
          "Amount_Invested_Monthly", "Amount_Invested_Monthly_binned",
-         "Spent_Level", "Value_Payments"] +
-        fe_cols +
-        ["has_clickstream"]
+         "Spent_Level", "Value_Payments",
+         "cs_snapshot_date", "has_clickstream"] +
+        fe_cols
     )
     df = df.select(ordered_cols)
 
