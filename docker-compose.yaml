@@ -1,11 +1,69 @@
 services:
-  jupyter:
+  airflow-init:
     build: .
-    container_name: jupyter_lab
-    ports:
-      - "8888:8888"
-    volumes:
-      - .:/app
     environment:
-      - JUPYTER_ENABLE_LAB=yes
-    command: ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--notebook-dir=/app", "--ServerApp.token=''", "--ServerApp.disable_check_xsrf=True"]
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__FERNET_KEY=PAqBeGJLJTYFzVkOGHWIYXdLO7XdXz5yTdxAGJe9ezM=
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__DAGS_FOLDER=/dags
+    volumes:
+      - airflow_data:/opt/airflow
+      - datamart:/opt/airflow/datamart
+      # outputs are bind-mounted to the host so they appear live, never wiped by
+      # `down -v` and no manual sync needed. These are pandas/joblib/matplotlib
+      # WRITES (not the Spark JVM reads that trigger the macOS FUSE EDEADLK), so
+      # bind-mounting them is safe. The inference bind layers on top of the
+      # datamart volume at its nested path.
+      - ./model_registry:/opt/airflow/model_registry
+      - ./datamart/gold/inference:/opt/airflow/datamart/gold/inference
+    entrypoint: >
+      /bin/bash -c "airflow db init &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true"
+
+  airflow-webserver:
+    build: .
+    depends_on:
+      - airflow-init
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__FERNET_KEY=PAqBeGJLJTYFzVkOGHWIYXdLO7XdXz5yTdxAGJe9ezM=
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__DAGS_FOLDER=/dags
+    volumes:
+      - airflow_data:/opt/airflow
+      - datamart:/opt/airflow/datamart
+      # outputs are bind-mounted to the host so they appear live, never wiped by
+      # `down -v` and no manual sync needed. These are pandas/joblib/matplotlib
+      # WRITES (not the Spark JVM reads that trigger the macOS FUSE EDEADLK), so
+      # bind-mounting them is safe. The inference bind layers on top of the
+      # datamart volume at its nested path.
+      - ./model_registry:/opt/airflow/model_registry
+      - ./datamart/gold/inference:/opt/airflow/datamart/gold/inference
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  airflow-scheduler:
+    build: .
+    depends_on:
+      - airflow-init
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__FERNET_KEY=PAqBeGJLJTYFzVkOGHWIYXdLO7XdXz5yTdxAGJe9ezM=
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__DAGS_FOLDER=/dags
+    volumes:
+      - airflow_data:/opt/airflow
+      - datamart:/opt/airflow/datamart
+      # outputs are bind-mounted to the host so they appear live, never wiped by
+      # `down -v` and no manual sync needed. These are pandas/joblib/matplotlib
+      # WRITES (not the Spark JVM reads that trigger the macOS FUSE EDEADLK), so
+      # bind-mounting them is safe. The inference bind layers on top of the
+      # datamart volume at its nested path.
+      - ./model_registry:/opt/airflow/model_registry
+      - ./datamart/gold/inference:/opt/airflow/datamart/gold/inference
+    command: scheduler
+
+volumes:
+  airflow_data:
+  datamart:
